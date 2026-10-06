@@ -1,0 +1,79 @@
+You are working in eval-platform, the L4 Evaluation Orchestrator. Do not redesign claim, SKIP LOCKED, lease, retry, or recovery. Two feature changes are already in the code. Use them as the source of truth.
+
+## Change 1 — Span-level tickets
+
+OLD grain:
+  1 ticket = 1 payload + 1 trace + 1 metric + 1 metric_version
+  span_selector only filtered which spans went onto that one evaluation_request
+  payload2.json (1 trace, 4 enabled checks) created 4 tickets
+
+NEW grain:
+  1 ticket = 1 payload + 1 trace + 1 metric + 1 metric_version + 1 span_id
+  TicketService loops: for each trace, for each enabled metric, for each span whose name is in span_selector.names, create one ticket
+  That ticket's evaluation_request.context.spans is a one-item list (that span only)
+  If no spans match, create 0 tickets for that metric (do not create an empty-span ticket)
+  payload2.json now creates 8 tickets: summary_present 1, policy_tool_called 1, workflow_sequence 3, all_agents_ran 3
+
+Idempotency key (build_idempotency_key in app/schemas/ticket.py):
+  payload_id, trace_id, metric_id, metric_version, span_id
+  Same four fields without span_id must not collapse three spans into one ticket
+
+Files already updated for span_id:
+  app/schemas/ticket.py — Ticket.span_id; 5-part key
+  app/models/evaluation_ticket.py — span_id column, ix_evaluation_tickets_span_id
+  app/models/evaluation_result.py — span_id column
+  app/schemas/result.py — Result.span_id
+  app/repositories/result_repository.py — copy ticket.span_id on success and error insert
+  app/services/ticket_service.py — per-span loop, CreatedTicket.span_id, context=EvaluationContext(spans=[span])
+  alembic/versions/0002_add_span_id.py — already applied (upgrade 0001 -> 0002)
+
+GET /v1/evaluations/tickets/{id} and .../result include span_id because Ticket and Result schemas have the field.
+
+## Change 2 — Batch eval: list in, list of scores out
+
+OLD: Orchestration submitted one ticket per thread; EvaluationExecutionService.execute called client.evaluate(one EvaluationExecutionRequest); one score; ResultService wrote one result.
+
+NEW:
+  After claim, group claimed tickets by trace_id
+  One evaluate_many(list[EvaluationExecutionRequest]) per group
+  Responses come back in the SAME ORDER as requests
+  Loop zip(tickets, responses) and apply each score with existing ResultService (DONE + evaluation_results row, or RETRY/FAILED)
+
+Batch contracts in app/schemas/evaluation.py:
+  EvaluationBatchRequest: { "requests": [ EvaluationExecutionRequest, ... ] }  min_length 1
+  EvaluationBatchResponse: { "responses": [ EvaluationExecutionResponse, ... ] }  same length and order
+  Each request item is the JSON already stored on ticket.evaluation_request (version, model, adapter, metric_id, plugin_id, plugin_input, context.spans with one span)
+
+Files already updated for batch:
+  app/clients/evaluation_client.py — abstract evaluate_many
+  app/clients/fake_evaluation_client.py — evaluate_many: one delay then one fake score per request
+  app/services/evaluation_execution_service.py — execute_many builds the list, calls evaluate_many, raises if response count mismatches
+  app/services/orchestration_service.py — _group_by_trace, _execute_group, _finish_group, _apply_response
+
+Queue logic NOT changed:
+  PostgreSQL evaluation_tickets is the queue
+  Claim: FOR UPDATE SKIP LOCKED, READY and RETRY only, limit = MAX_CONCURRENCY - in_flight
+  Then RUNNING, worker_id, attempt_count += 1, lease_expires_at
+  Recovery still expires stale RUNNING
+  ResultService retry/DONE/FAILED unchanged
+  CANCELLED is a valid status but no API writes it; claim never picks CANCELLED
+  Batch caveat: if evaluate_many throws once, every ticket in that group is RETRY/FAILED; per-item ERROR in the response list fails only that ticket
+
+## Config
+
+  .env MAX_CONCURRENCY=16 so one trace with ~8–12 tickets can be claimed together
+  POLL_INTERVAL_SECONDS=1, LEASE_SECONDS=60, FAKE_EVAL_DELAY_SECONDS=15
+
+## Proven locally
+
+  POST temp/payload2.json returned ticket_count 8
+  evaluation_results had 8 rows: metric_id + span_id + score 1 + SUCCESS
+  Span ids match payload2: classifier 00f067aa0ba902b7, validator 0af7651916cd43dd, summarizer 7a3b1c2d4e5f6071
+
+## Rules for Copilot
+
+  Do not revert span_id in the idempotency key
+  Do not go back to one evaluate() per ticket unless asked
+  Do not redesign SKIP LOCKED / lease / retry
+  Do not recreate deleted pytest files unless asked
+  README.md still describes the old trace × metric formula; update it only if asked
